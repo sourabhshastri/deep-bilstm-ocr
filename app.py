@@ -1,8 +1,11 @@
 import warnings
 import os
+import gc
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import streamlit as st
 import easyocr
@@ -10,7 +13,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-# Multi-page PDF support via PyMuPDF
 try:
     import fitz  # PyMuPDF
     PDF_SUPPORT = True
@@ -30,23 +32,24 @@ st.write(
     "**CRNN-BiLSTM** sequence recognition."
 )
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Initializing Deep BiLSTM OCR Engine (takes ~30s on first boot)...")
 def load_bilstm_ocr():
-    return easyocr.Reader(
+    reader = easyocr.Reader(
         lang_list=['en'],
         gpu=False,
         recog_network='standard',  # CNN + BiLSTM + CTC decoder
         verbose=False
     )
+    gc.collect()
+    return reader
 
-with st.spinner("Loading Deep BiLSTM OCR Engine..."):
-    reader = load_bilstm_ocr()
+reader = load_bilstm_ocr()
 
 
 def enhance_image_for_deep_ocr(img_rgb, upscale_factor=2.0):
     if upscale_factor > 1.0:
         h, w = img_rgb.shape[:2]
-        if max(h, w) < 2200:
+        if max(h, w) < 1600:
             img_rgb = cv2.resize(
                 img_rgb,
                 None,
@@ -92,7 +95,7 @@ def deep_scan_single_image(pil_img, conf_thresh, deep_mode, draw_boxes):
         text_threshold=0.5,
         low_text=0.3,
         link_threshold=0.3,
-        canvas_size=2560,
+        canvas_size=1600,
         mag_ratio=1.5
     )
 
@@ -105,9 +108,9 @@ def deep_scan_single_image(pil_img, conf_thresh, deep_mode, draw_boxes):
             rect = [min(xs), min(ys), max(xs), max(ys)]
             raw_detections.append((rect, text.strip(), prob))
 
-    # Pass 2: Enhanced + Upscaled + Sharpened Image (for vehicle plates & faint text)
+    # Pass 2: Enhanced + Upscaled + Sharpened Image
     if deep_mode:
-        scale = 2.0 if max(orig_h, orig_w) < 2200 else 1.0
+        scale = 2.0 if max(orig_h, orig_w) < 1600 else 1.0
         enhanced_rgb = enhance_image_for_deep_ocr(orig_rgb, upscale_factor=scale)
         for (bbox, text, prob) in reader.readtext(enhanced_rgb, **ocr_kwargs):
             if prob >= conf_thresh and text.strip():
@@ -115,6 +118,8 @@ def deep_scan_single_image(pil_img, conf_thresh, deep_mode, draw_boxes):
                 ys = [p[1] / scale for p in bbox]
                 rect = [min(xs), min(ys), max(xs), max(ys)]
                 raw_detections.append((rect, text.strip(), prob))
+        del enhanced_rgb
+        gc.collect()
 
     # Deduplicate overlapping boxes keeping highest confidence
     raw_detections.sort(key=lambda x: x[2], reverse=True)
@@ -185,13 +190,12 @@ if input_mode == "📁 Upload Image or Multi-Page PDF":
                 pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 for page_num in range(len(pdf_doc)):
                     page = pdf_doc.load_page(page_num)
-                    pix = page.get_pixmap(dpi=250)
+                    pix = page.get_pixmap(dpi=200)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     pages_to_scan.append((f"Page {page_num + 1}", img))
         else:
             pages_to_scan.append(("Uploaded Image", Image.open(uploaded_file).convert("RGB")))
 else:
-    # Automatically supports mobile front & rear camera switching
     camera_photo = st.camera_input("Capture text or vehicle number plate with camera")
     if camera_photo is not None:
         pages_to_scan.append(("Captured Image", Image.open(camera_photo).convert("RGB")))
@@ -220,7 +224,7 @@ if pages_to_scan:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Annotated Detection Map")
-        st.image(first_annotated_img, use_container_width=True)
+        st.image(first_annotated_img, width="stretch")
 
     with col2:
         st.subheader("Complete Extracted Text")
